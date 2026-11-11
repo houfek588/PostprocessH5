@@ -1,0 +1,693 @@
+from pyNastran.bdf.bdf import BDF
+from pyNastran.op2.op2_geom import OP2Geom
+from pyNastran.op2.op2 import OP2
+import h5py
+
+# h5 files - https://github.com/SteveDoyle2/pyNastran/issues/308
+
+class ParseBdfFile:
+    def __init__(self, file_path):
+
+        try:
+            # Initialize the BDF model
+            self.model = BDF()
+
+            # Read the BDF file
+            self.model.read_bdf(file_path)
+
+            print(f"File {file_path} was succesfully loaded")
+        except FileNotFoundError:
+            print(f"Error: File {file_path} not found.")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+
+    def print_statistics(self):
+        # Access information from the model
+        print(f"Number of nodes: {len(self.model.nodes)}")
+        print(f"Number of elements: {len(self.model.elements)}")
+        print(f"Number of properties: {len(self.model.properties)}")
+        print(f"Number of materials: {len(self.model.materials)}")
+        print(f"Number of loads: {len(self.model.loads)}")
+
+    def print_materials(self):
+        print("File contains these materials:")
+        for m in self.model.materials:
+            print(self.model.materials[m])
+
+    def print_loads(self):
+        print("File contains these loads:")
+        # for m in self.model.loads:
+            # print(self.model.loads[m])
+            # print(self.model.loads[m].__getattribute__())
+
+        print("model")
+        print(self.model)
+        print("model.loads")
+        print(self.model.loads)
+        print(type(self.model.loads))
+        print("other")
+        for k in self.model.loads.keys():
+            print(f"Key: {k}, load: {self.model.loads[k]}")
+
+
+        # print(type(self.model.loads[6]))
+        # print(type(self.model.loads[6][0]))
+        #
+        # print(type(self.model.loads[6][0].components))
+        # print(self.model.loads[6][0].components)
+        # print(self.model.loads[6][0].type)
+
+        # print("list class print")
+        # print(self.model.loads[1][0].N)
+        # print(self.model.loads[1][0].type)
+        #
+        # self.model.loads[1][0].N[0] = 10.0
+        #
+        # print(self.model.loads[1][0].N)
+        # for l in self.model.loads[1]:
+        #     print(l.comment)
+        #     a = l.comment.split(" ")
+        #     print()
+        #
+        #     a[-1] = "kjsdkf\n"
+        #
+        #     tt = ""
+        #     for o in a:
+        #         tt = tt + o + " "
+        #
+        #     print(tt)
+        #     print(type(l))
+        #     print(l.scale)
+        #     print(l.cid)
+        #     print(l.sid)
+        #     print(l.N)
+        #     print(l.N[2])
+        #     print(l.mb)
+        #     print(l.cid_ref)
+        #
+        #     print(l.Cid())
+        #     print(l.GravityVector())
+        #     print(l.raw_fields())
+        # # print(self.model.loads[0].sid)
+        #
+        # print("get")
+        # print(self.model.get_reduced_loads())
+        # print(self.model.get_)
+        return list(self.model.loads.keys())
+
+    def update_load_orientation(self, id, new: list, name=" "):
+        print("Load to change:")
+        print(self.model.loads[id])
+
+        if self.model.loads[id][0].type == "GRAV":
+            subname = "gravity"
+            print(f"Old load orientation parameters: {self.model.loads[id][0].N}")
+
+            if len(self.model.loads[id][0].N) != len(new):
+                return f"Wrong number of new parameters, it has to be: {len(self.model.loads[id][0].N)}"
+
+            for i in range(0,len(self.model.loads[id][0].N)):
+                self.model.loads[id][0].N[i] = float(new[i])
+
+            print(f"New load orientation parameters: {self.model.loads[id][0].N}")
+
+        elif self.model.loads[id][0].type == "SPCD":
+            subname = "acceleration"
+            print(f"Old load orientation parameters: {self.model.loads[id][0].components}")
+
+            non_zero_indices = [i+1 for i, val in enumerate(new) if val != 0]
+            components = "".join(map(str, non_zero_indices))
+            self.model.loads[id][0].components = [components]
+
+            print(f"New load orientation parameters: {self.model.loads[id][0].components}")
+        else:
+            return "non defined load !!!"
+
+        if name != " ":
+            comment = self.model.loads[id][0].comment.split(" ")
+
+            comment[-1] = subname + name + "\n"
+            print(comment)
+            comment.pop(0)
+            new_text = " "
+            for c in comment:
+                print(c)
+                new_text = new_text + c + " "
+
+            self.model.loads[id][0].comment = new_text
+
+        # self.model.loads[id][0].N[1] = float(y)
+        # self.model.loads[id][0].N[2] = float(z)
+
+
+        print(f"New comment: {self.model.loads[id][0].comment}")
+
+    def update_material(self, ID, E = 0, rho=0, ny=0):
+        print("Old material parameters:", end=" ")
+        print(f"ID = {self.model.materials[ID].Mid()}, E = {self.model.materials[ID].e}, rho = {self.model.materials[ID].rho}, ny = {self.model.materials[ID].nu}")
+
+        if E != 0:
+            self.model.materials[1].e = float(E)
+        if rho != 0:
+            self.model.materials[1].rho = float(rho)
+        if ny != 0:
+            self.model.materials[1].ny = float(ny)
+
+        print("Mew material parameters:", end=" ")
+        print(
+            f"ID = {self.model.materials[ID].Mid()}, E = {self.model.materials[ID].e}, rho = {self.model.materials[ID].rho}, ny = {self.model.materials[ID].nu}")
+
+    def save_bdf_file(self, file_path):
+        self.model.write_bdf(file_path)
+        print(f"File {file_path} was saved")
+
+
+class ParseOP2File:
+    def __init__(self, file_name, h5=False):
+        """
+            Extracts accelerations from an OP2 file.
+
+            Args:
+                op2_file (str): Path to the OP2 file.
+
+            Returns:
+                dict: Parsed acceleration data.
+            """
+        op2 = OP2()
+
+        try:
+            # Read the OP2 file
+            # if h5:
+            #     op2.load_hdf5_file(file_name)
+            # else:
+            #     op2.read_op2(file_name)
+            op2.read_op2(file_name)
+
+            # Extract acceleration data
+            self.acceleration_data = op2.accelerations
+
+            if not self.acceleration_data:
+                print("No acceleration data found in the OP2 file.")
+
+            subcase = 1
+            # Print acceleration data for each subcase
+            # for subcase, accelerations in self.acceleration_data.items():
+            accelerations = self.acceleration_data[1]
+
+            self.df = accelerations.freqs
+            self.complex = accelerations.data
+            self.real_part = accelerations.data.real
+            self.imag_part = accelerations.data.imag
+
+            print(f"File {file_name} was succesfully loaded")
+            print(f"Subcase {subcase} loaded")
+            print(f"File contains {len(self.complex[0])} nodes")
+
+        except FileNotFoundError:
+            print(f"Error: File {file_name} not found.")
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+
+    def get_magnitude_acceleration(self, node):
+        """
+        Calculates the resultant acceleration magnitude for a given node.
+
+        Args:
+            node (int): The node number for which to calculate the resultant acceleration.
+
+        Returns:
+            list[float]: A list of resultant acceleration magnitudes at each frequency step.
+        """
+
+        accX = self.get_acc_node_complex_data(node, "X")
+        accY = self.get_acc_node_complex_data(node, "Y")
+        accZ = self.get_acc_node_complex_data(node, "Z")
+
+
+        acc = [abs(complex(acc_x ** 2 + acc_y ** 2 + acc_z ** 2)) ** 0.5 for acc_x, acc_y, acc_z in zip(accX, accY, accZ)]
+
+        # acc = []
+        # for i in range(0,len(accX)):
+        #     aa = cmath.sqrt(acc_x ** 2 + acc_y ** 2 + acc_z ** 2)
+        #     acc.append(cmath.polar(aa)[0])
+
+        return acc
+
+    def get_acc_node_data(self, node, axis):
+        """
+            Calculates the magnitudes of complex acceleration data for a specific axis.
+
+        Args:
+            node (int): The node number.
+            axis (str): The axis ('X', 'Y', 'Z') to get acceleration data for.
+
+        Returns:
+            list[float]: A list of magnitudes for the complex acceleration data.
+        """
+
+        acc_axis = self.get_acc_node_complex_data(node, axis)
+        return [abs(value) for value in acc_axis]
+
+    def get_acc_node_complex_data(self, node, axis):
+        """
+        Extracts acceleration data for a specific node and axis from a 3D dataset.
+
+        Args:
+            node (int): Node index (1-based).
+            axis (str): Axis to extract ("X", "Y", or "Z").
+
+        Returns:
+            List[float]: List of acceleration values for the specified node and axis.
+
+        Raises:
+            ValueError: If the axis is invalid or the node index is out of bounds.
+        """
+
+        # Map axis to index
+        axis_map = {"X": 0, "Y": 1, "Z": 2}
+        if axis not in axis_map:
+            raise ValueError(f"Invalid axis '{axis}'. Choose from 'X', 'Y', or 'Z'.")
+
+        axis_par = axis_map[axis]
+
+        node_indices = self.acceleration_data[1].node_gridtype[:, 0]
+        node_index = -1
+        try:
+            if node in node_indices:
+                node_index = list(node_indices).index(node)
+        except:
+            raise ValueError(f"Node index {node} is out of bounds for the dataset.")
+
+        # print(f"File contain {len(self.complex[0])} nodes")
+        # print(f"Node {node} has index {node_index}")
+
+        return [row[node_index][axis_par] for row in self.complex]
+
+    def get_frequencies(self):
+        return self.df
+
+
+def read_pch_file(pch_file):
+    """
+    Reads a PCH file and extracts its content.
+
+    Args:
+        pch_file (str): Path to the PCH file.
+    """
+    # Load the OP2Geom parser (PCH is similar in structure to OP2 data)
+    model = OP2Geom()
+
+    # Read the PCH file
+    model.read_op2(pch_file)
+
+    # Access results (e.g., displacements, forces, etc.)
+    for key, value in model.displacements.items():
+        print(f"Displacement for key {key}: {value}")
+
+    for key, value in model.stresses.items():
+        print(f"Stress for key {key}: {value}")
+
+    for key, value in model.forces.items():
+        print(f"Force for key {key}: {value}")
+
+
+
+
+#
+
+# print(n2p.VERSION)
+# output_file = "C:\Projects\MKP\Patran_tutorial\Sestava02\MKP\static_calc.h5"
+output_file = "box2_weight1g_z_ch.h5"
+
+
+
+
+# Nastran 2016 Release Guide Example #1
+#
+print("Read Nastran H5 file and print node displacement")
+# -------------------------------------------------------------------------
+# Extract nodal displacements and print or echo to window
+# -------------------------------------------------------------------------
+
+import h5py   #Not required for this example
+import tables
+import pyvista as pv
+from vtk import VTK_QUADRATIC_TETRA, VTK_QUADRATIC_WEDGE, VTK_QUADRATIC_HEXAHEDRON
+import numpy as np
+#import numpy   #Not required for this example
+
+# --- open h5 input file
+#   - Elm1.bdf is single element model that is different than Release Guide.
+#   - Use your own model if you like. Compare output to F06 or HDFView (https://www.hdfgroup.org/products/java/hdfview/)
+#   - In bulk section add MDLPRM,HDF5,1 to get a *.h5 file.
+FileIn = output_file
+with h5py.File(FileIn, "r") as f:
+    for i in f["NASTRAN"]:
+        print(i)
+
+    print("Input structure:")
+    for i in f["NASTRAN/INPUT"]:
+        print(i)
+
+# Open database file
+#file = tables.open_file("test.h5")
+file = tables.open_file(FileIn)
+
+# Get displacement table. See s
+# disp = file.root.NASTRAN.RESULT.NODAL.DISPLACEMENT
+nodes = file.root.NASTRAN.INPUT.NODE.GRID
+# elements_chexa = file.root.NASTRAN.INPUT.ELEMENT.CHEXA
+# elements_conm2 = file.root.NASTRAN.INPUT.ELEMENT.CONM2
+# elements_cpenta = file.root.NASTRAN.INPUT.ELEMENT.CPENTA
+elements_ctetra = file.root.NASTRAN.INPUT.ELEMENT.CTETRA
+print(file.root.NASTRAN.RESULT)
+# Get row number 2 of the table
+print("print nodes")
+node_rows = []
+for i in range(0,10):
+    node_rows.append(nodes[i])
+
+# print(node_rows)
+
+# Get row number 2 of the table
+print("print elements")
+element_rows = []
+for i in range(0, 10):
+    element_rows.append(elements_ctetra[i])
+print(element_rows)
+
+
+# Print grid id and its displacement
+# print(row)
+# In terminal window you should see:
+# 3 [  0.00000000e+00  -3.00000000e-05   0.00000000e+00   0.00000000e+00   0.00000000e+00   5.63827489e-21]
+# Example: access node positions and element connectivity
+# Replace these paths with your actual node and element table paths
+nodes_full = file.get_node('/NASTRAN/INPUT/NODE/GRID')[:]         # shape (N, 3)
+# elements_tet_full = file.get_node('/NASTRAN/INPUT/ELEMENT/CTETRA')[:]  # shape (M1, 10)
+# elements_pen_full = file.get_node('/NASTRAN/INPUT/ELEMENT/CPENTA')[:]  # shape (M2, 15)
+# elements_hex_full = file.get_node('/NASTRAN/INPUT/ELEMENT/CHEXA')[:]   # shape (M3, 20)
+displacement_full = file.get_node('/NASTRAN/RESULT/NODAL/DISPLACEMENT')[:]  # shape: (N, 3)
+
+ele_types_num = file.get_node('/NASTRAN/INPUT/ELEMENT/')  # shape (M1, 10)
+print(f"ele_types_num: {type(ele_types_num)}")
+print(f"ele_types_num: {ele_types_num._g_getnchildren()}")
+
+# print(f"elements_tet_full type: {type(elements_tet_full)}")
+
+
+
+nodes = []
+for n in nodes_full:
+    nodes.append([n[0], n[2][0], n[2][1], n[2][2]])
+
+displacement = []
+for n in displacement_full:
+    row = [n[1], n[2], n[3]]
+    displacement.append(row)
+
+if ele_types_num._g_getnchildren() == 1:
+    elements_tet_full = file.get_node('/NASTRAN/INPUT/ELEMENT/CTETRA')[:]  # shape (M1, 10)
+
+
+    elements_tet = []
+    for n in elements_tet_full:
+        elements_tet.append(list(n[2]))
+
+    # elements_pen = []
+    # for n in elements_pen_full:
+    #     elements_pen.append(list(n[2]))
+    #
+    # elements_hex = []
+    # for n in elements_hex_full:
+    #     elements_hex.append(list(n[2]))
+    #
+
+    file.close()
+
+    print(f"nodes: {nodes[2]}")
+    print(f"nodes type: {type(nodes)}")
+    print(f"elements_tet: {elements_tet[2]}")
+    print(f"num nodes: {len(nodes)}")
+    print(f"num elements_tet: {len(elements_tet)}")
+
+
+    # Each row: [ID, x, y, z]
+    # nodes = np.array([
+    #     [100, -0.0, 0.0, -0.5],
+    #     [101, 0.0, 0.0, 0.5],
+    #     [102, -0.43, 0.0, -0.25],
+    #     [103, -0.43, 0.0, 0.25],
+    #     [104, -0.0, 0.43, -0.25],
+    #     [105, 0.0, 0.43, 0.25],
+    #     [106, 0.43, 0.0, -0.25],
+    #     [107, 0.43, 0.0, 0.25],
+    #     [108, 0.0, -0.43, -0.25],
+    #     [109, 0.0, -0.43, 0.25],
+    # ])
+    print(f"ex nodes type: {type(nodes)}")
+    #
+    # # Tetrahedrons referencing real node IDs
+    # elements_with_ids = np.array([
+    #     [100, 105, 108, 107],
+    #     [107, 103, 108, 109],
+    #     [107, 103, 101, 105],
+    #     [109, 103, 101, 107],
+    # ])
+    elements_with_ids = elements_tet
+
+    # Map node IDs to point indices
+    node_ids = []
+    points = []
+    for i in nodes:
+        node_ids.append(i[0])
+        points.append([i[1], i[2], i[3]])
+
+    id_to_index = {node_id: i for i, node_id in enumerate(node_ids)}
+
+    # Convert element node IDs to indices
+    cells = []
+    for elem in elements_with_ids:
+        indices = [id_to_index[nid] for nid in elem]
+        cells.append([10] + indices)  # 10 nodes per Tetra10
+
+    print(f"cells: {cells[2]}")
+    cells = np.array(cells)
+    celltypes = np.full(len(cells), fill_value=pv.CellType.QUADRATIC_TETRA, dtype=np.uint8)
+
+    # Create unstructured grid
+    grid = pv.UnstructuredGrid(cells, celltypes, points)
+
+    # Store external node IDs as point data
+    # grid.point_data["Node ID"] = node_ids
+    print(f"displacement: {displacement[2]}")
+    disp_x = []
+    for d in displacement:
+        disp_x.append(d[0])
+
+    grid.point_data["Displacement"] = disp_x
+
+    # ugrid["Displacement"] = displacement
+    grid.plot(show_edges=True)
+    # grid.save('mixed_elements.vtk')  # VTK XML format (best for high-order elements)
+
+else:
+    elements_tet_full = file.get_node('/NASTRAN/INPUT/ELEMENT/CTETRA')[:]  # shape (M1, 10)
+    elements_pen_full = file.get_node('/NASTRAN/INPUT/ELEMENT/CPENTA')[:]  # shape (M2, 15)
+    elements_hex_full = file.get_node('/NASTRAN/INPUT/ELEMENT/CHEXA')[:]   # shape (M3, 20)
+
+    elements_tet = []
+    for n in elements_tet_full:
+        elements_tet.append(list(n[2]))
+
+    elements_pen = []
+    for n in elements_pen_full:
+        elements_pen.append(list(n[2]))
+
+    elements_hex = []
+    for n in elements_hex_full:
+        elements_hex.append(list(n[2]))
+
+
+    file.close()
+
+    print(f"nodes: {nodes[2]}")
+    print(f"nodes type: {type(nodes)}")
+    print(f"elements_tet: {elements_tet[2]}")
+    print(f"number of nodes: {len(nodes)}")
+    print(f"number of displacements: {len(displacement)}")
+    print("-------------------------------------------")
+    print(f"number of CTETRA elements: {len(elements_tet)}")
+    print(f"number of CPENTA elements: {len(elements_pen)}")
+    print(f"number of CHEXA elements: {len(elements_hex)}")
+
+    print(f"pen ele: {elements_pen[2]}")
+
+    # Each row: [ID, x, y, z]
+    # nodes = np.array([
+    #     [100, -0.0, 0.0, -0.5],
+    #     [101, 0.0, 0.0, 0.5],
+    #     [102, -0.43, 0.0, -0.25],
+    #     [103, -0.43, 0.0, 0.25],
+    #     [104, -0.0, 0.43, -0.25],
+    #     [105, 0.0, 0.43, 0.25],
+    #     [106, 0.43, 0.0, -0.25],
+    #     [107, 0.43, 0.0, 0.25],
+    #     [108, 0.0, -0.43, -0.25],
+    #     [109, 0.0, -0.43, 0.25],
+    # ])
+    # print(f"ex nodes type: {type(nodes)}")
+    #
+    # # Tetrahedrons referencing real node IDs
+    # elements_with_ids = np.array([
+    #     [100, 105, 108, 107],
+    #     [107, 103, 108, 109],
+    #     [107, 103, 101, 105],
+    #     [109, 103, 101, 107],
+    # ])
+    elements_with_ids = elements_tet
+
+    # Map node IDs to point indices
+    node_ids = []
+    points = []
+    for i in nodes:
+        node_ids.append(i[0])
+        points.append([i[1], i[2], i[3]])
+
+    print(f"number of points: {len(points)}")
+
+
+    id_to_index = {node_id: i for i, node_id in enumerate(node_ids)}
+
+    print(f"id_to_index: {id_to_index[1]}")
+    print(f"id_to_index: {id_to_index[2]}")
+    print(f"id_to_index: {id_to_index[3]}")
+    # print(f"id_to_index type: {type(id_to_index)}")
+    # print(f"id_to_index: {id_to_index[2]}")
+    # print(f"id_to_index: {min(id_to_index.keys())}")
+
+    # === 4. Convert to VTK format (cell layout) ===
+    # cells = [
+    #     np.array([10] + [id_to_index[nid] for nid in elements_tet]),
+    #     np.array([20] + [id_to_index[nid] for nid in elements_hex])
+    # ]
+    cells_tet = []
+    for elem in elements_tet:
+
+        indices = [id_to_index[nid] for nid in elem]
+        cells_tet.append([len(indices)] + indices)  # 10 nodes per Tetra10
+
+    cells_pen = []
+    for elem in elements_pen:
+        # print(elem)
+        indices = []
+        for nid in elem:
+            if nid == 0:
+                # indices.append(nid)
+                continue
+            else:
+                indices.append(id_to_index[nid])
+        # indices = [id_to_index[nid] for nid in elem]
+        cells_pen.append([len(indices)] + indices)  # 15 nodes per Tetra10
+
+    print(f"indices: {len(indices)}")
+    # print(f"elements_hex: {elements_hex}")
+    cells_hex = []
+    for elem in elements_hex:
+        # print(elem)
+        indices = []
+        for nid in elem:
+            if nid == 0:
+                indices.append(nid)
+                # continue
+            else:
+                indices.append(id_to_index[nid])
+        # indices = [id_to_index[nid] for nid in elem]
+        cells_hex.append([len(indices)] + indices)  # 10 nodes per Tetra10
+
+    # print(cells_hex)
+    # Flatten cell array and create offset array
+    # cell_array = np.hstack(cells)
+
+    print(f"tetra cell creation")
+    cells_tet = np.array(cells_tet)
+    celltypes_tet = np.full(len(cells_tet), fill_value=pv.CellType.QUADRATIC_TETRA, dtype=np.uint8)
+    grid_tet = pv.UnstructuredGrid(cells_tet, celltypes_tet, points)
+
+    print(f"hexa cell creation")
+    cells_hex = np.array(cells_hex)
+    celltypes_hex = np.full(len(cells_hex), fill_value=pv.CellType.HEXAHEDRON, dtype=np.uint8)
+    grid_hex = pv.UnstructuredGrid(cells_hex, celltypes_hex, points)
+
+    print(f"penta cell creation")
+    print(f"pen cells: {cells_pen[1]}")
+    print(f"pen cells: {cells_pen[2]}")
+    print(f"pen cells: {cells_pen[3]}")
+    cells_pen = np.array(cells_pen)
+    celltypes_pen = np.full(len(cells_pen), fill_value=pv.CellType.WEDGE, dtype=np.uint8)
+    grid_pen = pv.UnstructuredGrid(cells_pen, celltypes_pen, points)
+
+    print(f"number of tetra points: {grid_tet.GetNumberOfPoints()}")
+    print(f"number of hex points: {grid_hex.GetNumberOfPoints()}")
+    print(f"number of penta points: {grid_pen.GetNumberOfPoints()}")
+
+
+
+
+    # cleaned_grid = remove_unused_points(grid_hex)
+    # print(f"number of cleaned hex points: {cleaned_grid.GetNumberOfPoints()}")
+
+    # Store external node IDs as point data
+    # grid.point_data["Node ID"] = node_ids
+    # combine.point_data["Displacement"] = displacement
+    # combine = grid_tet + grid_hex + grid_pen
+    # combined = grid_tet.merge(grid_hex, merge_points=True)
+    combined = grid_tet.merge(grid_hex, merge_points=False)
+    print(f"number of combine1 points: {combined.GetNumberOfPoints()}")
+    combined = combined.merge(grid_pen, merge_points=True)
+    print(f"number of combine2 points: {combined.GetNumberOfPoints()}")
+    # shared_points = np.intersect1d(grid_tet.point_indices, grid_hex.point_indices)
+
+    print(f"pen ghost points: {len(grid_pen.points)}")
+    print(f"pen ghost points: {len(combined.points)}")
+
+    from scipy.spatial import cKDTree
+    # Build trees
+    original_points = grid_pen.points
+    merged_points = combined.points
+
+    list1 = original_points
+    list2 = merged_points
+
+    # Subtracting corresponding elements of sublists
+    result = [[a - b for a, b in zip(sublist1, sublist2)] for sublist1, sublist2 in zip(list1, list2)]
+
+    print(result)
+
+
+    # print(f"ghost points array: {len(grid_pen.GetPointGhostArray())}")
+
+    # print(grid_tet.GetPoint(344401))
+
+    # print(f"number of combine points: {combined.GetPointData()}")
+    # combine.point_data["Displacement"] = displacement
+    # combine["Displacement"] = displacement
+    print(f"displacement: {displacement[2]}")
+    disp_x = []
+    for d in displacement:
+        disp_x.append(d[0])
+    combined["Displacement"] = disp_x
+
+    print("ploting...")
+    combined.plot(show_edges=True)
+    combined.save('mixed_elements.vtk')  # VTK XML format (best for high-order elements)
+
+
+
+
+
+
+
+print("Done!")
+
+
