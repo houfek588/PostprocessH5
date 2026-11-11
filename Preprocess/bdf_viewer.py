@@ -18,10 +18,12 @@ from qtpy import QtGui, QtWidgets  # noqa: E402  (available - checked by h5_view
 
 
 class BdfViewer(H5ResultViewer):
-    def __init__(self, model, cmap="jet", show_edges=True, window_size=(1650, 950)):
+    def __init__(self, model, cmap="jet", show_edges=True, window_size=(1650, 950), window=None, prepared=None):
         """
         Args:
             model (BdfModel): analysed Nastran input model
+            window (ViewerWindow): window to show the model in (None = new window)
+            prepared (dict): result of BdfViewer.prepare(model) (computed in the background by the window)
         """
         self.model = model
         self._entity_actors = {}                                # key -> [actors]
@@ -29,8 +31,11 @@ class BdfViewer(H5ResultViewer):
         self._entity_visible = {key: True for key in model.entities}
         n_labels = sum(len(e.get("texts") or []) for e in model.entities.values())
         self.show_labels = n_labels <= 10                       # many labels -> off at start
-        super().__init__(model, cmap=cmap, show_edges=show_edges, window_size=window_size)
-        self.window.setWindowTitle(f"Nastran model - {model.file_path.name}")
+        super().__init__(model, cmap=cmap, show_edges=show_edges, window_size=window_size, window=window,
+                         prepared=prepared)
+
+    def title(self):
+        return f"Nastran model - {self.model.file_path.name}"
 
     # ================================================================================================= panel
     def _build_panel(self):

@@ -1,12 +1,18 @@
 """
 Interactive 3D viewer of MSC Nastran H5 results (read by file_processing.read_Nastran_files.ParseH5File).
 
-Qt window:
-    left   - result step (time / frequency / mode) with amplitude / phase / real / imaginary part of complex
-             results, table of all results (click / arrow keys = show the result), display and section settings,
-             selected node (double-click in 3D or node ID) with the values of the current result group
+Window (visualization/viewer_window.py): menu File - Open (Ctrl+O), Open recent, Reload (F5), Save / restore camera
+view; a file can be dragged & dropped into the window; files are loaded in the background (progress in the status
+bar), so the window does not freeze.
+    left   - tab "Results": result step (time / frequency / mode) with amplitude / phase / real / imaginary part of
+             complex results, table of all results (click / arrow keys = show the result), display (deformation,
+             animation), section, selected node (double-click in 3D or node ID) with the values of the current group
+           - tab "Random" (frequency response): random vibration - input acceleration PSD, response PSD in the
+             selected node, RMS / 3 sigma maps of the whole model (file_processing/random_response.py)
+           - tab "Modes" (eigenvalue summary in the file): natural frequencies, click = mode shape / nearest frequency
     right  - 3D view (pyvista) and, if the results have more steps, a graph of the current result in the selected
-             node over time / frequency (click into the graph = show that step)
+             node over time / frequency (click into the graph = show that step) with the natural frequencies as
+             vertical lines, or the response PSD of the random vibration
 
 Requires Qt for Python (once):   pip install pyvistaqt PySide6        (PyQt5 / PyQt6 work as well)
 If more Qt bindings are installed, PySide6 is used (can be changed by the environment variable QT_API).
@@ -24,9 +30,8 @@ Sections are made on a linear copy of the mesh (corner nodes of quadratic elemen
 in the undeformed shape and deformed afterwards.
 """
 import csv
-import importlib.util
-import os
 import sys
+import time
 import traceback
 from collections import Counter
 
@@ -38,55 +43,8 @@ from vtkmodules.vtkFiltersGeneral import vtkTableBasedClipDataSet
 from vtkmodules.vtkFiltersGeometry import vtkDataSetSurfaceFilter
 from vtkmodules.vtkRenderingCore import vtkCellPicker
 
-# PySide6 is preferred (tested; PyQt aborts the whole application on a Python error in a Qt callback)
-if not os.environ.get("QT_API") and importlib.util.find_spec("PySide6") is not None:
-    os.environ["QT_API"] = "pyside6"
-
-try:
-    from pyvistaqt import MainWindow, QtInteractor
-    from qtpy import QtCore, QtGui, QtWidgets
-except Exception as error:  # ImportError or "no Qt bindings found"
-    raise ImportError("The H5 viewer needs Qt for Python, install it by:  pip install pyvistaqt PySide6") from error
-
-
-def _qt_enum(scope, name):
-    """Qt enum value working with PySide6 / PyQt5 / PyQt6 (unscoped or scoped access)."""
-    value = getattr(QtCore.Qt, name, None)
-    return value if value is not None else getattr(getattr(QtCore.Qt, scope), name)
-
-
-_APP = None
-
-
-def _print_qt_message(mode, context, message):
-    # on Windows Qt writes its messages (also the fatal ones) to the debugger, not to the console -> print them
-    print(f"Qt: {message}", file=sys.stderr)
-
-
-def _print_python_error(exc_type, exc_value, exc_traceback):
-    traceback.print_exception(exc_type, exc_value, exc_traceback)
-
-
-def qt_app():
-    """
-    Returns the QApplication - created once and kept alive (a QApplication without a Python reference is deleted
-    immediately by PyQt and the next window crashes the program). Qt messages and Python errors in Qt callbacks
-    are printed to the console.
-    """
-    global _APP
-    if _APP is None:
-        _APP = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-        QtCore.qInstallMessageHandler(_print_qt_message)
-        if sys.excepthook is sys.__excepthook__:
-            sys.excepthook = _print_python_error        # PyQt: print the error instead of aborting the program
-    return _APP
-
-
-USER_ROLE = _qt_enum("ItemDataRole", "UserRole")
-HORIZONTAL = _qt_enum("Orientation", "Horizontal")
-VERTICAL = _qt_enum("Orientation", "Vertical")
-ITEM_ENABLED = _qt_enum("ItemFlag", "ItemIsEnabled")
-TEXT_SELECTABLE = _qt_enum("TextInteractionFlag", "TextSelectableByMouse")
+from visualization.qt_base import (HORIZONTAL, ITEM_ENABLED, TEXT_SELECTABLE, USER_ROLE, VERTICAL,  # noqa: F401
+                                   QtCore, QtGui, QtInteractor, QtWidgets, TaskRunner, qt_app, run_app, safe_call)
 
 COMPLEX_MODES = (("amplitude", "Amplitude"), ("phase", "Phase [deg]"), ("real", "Real part"),
                  ("imag", "Imaginary part"))
@@ -97,28 +55,29 @@ def _fmt(value):
 
 
 class H5ResultViewer:
-    def __init__(self, h5, cmap="jet", show_edges=True, window_size=(1650, 980)):
+    def __init__(self, h5, cmap="jet", show_edges=True, window_size=(1650, 980), window=None, prepared=None):
         """
         Args:
             h5 (ParseH5File / NastranMesh): loaded Nastran results (or model)
             cmap (str): matplotlib colormap name
             show_edges (bool): show element edges at start
-            window_size (tuple): window size in pixels
+            window_size (tuple): window size in pixels (if a new window is created)
+            window (ViewerWindow): window to show the viewer in (None = new window)
+            prepared (dict): result of H5ResultViewer.prepare(h5) (computed in the background by the window)
         """
         self.app = qt_app()
 
         self.h5 = h5
         h5.to_pyvista()                                 # fills h5.results
-        self.results = h5.results                       # [(name, "point" / "cell")]
+        self.results = h5.results                       # [(name, "point" / "cell")] - shared list (new results)
         self.steps = list(getattr(h5, "steps", []))     # result steps (time, frequency, modes)
         self.has_complex = any(h5.is_complex(name) for name, _ in self.results)
-        per_subcase = Counter((s["subcase"], s["kind"]) for s in self.steps)
-        self.has_history = any(n > 1 for n in per_subcase.values())
+        per_series = Counter(self._series(i) for i in range(len(self.steps)))
+        self.has_history = any(n > 1 for n in per_series.values())
 
-        # linear copy of the mesh (same points, cells and data arrays) with own data attributes
-        self.grid = pv.UnstructuredGrid()
-        self.grid.ShallowCopy(h5.to_pyvista(linear=True))
-        self.grid.cell_data["_cell_index"] = np.arange(self.grid.n_cells)
+        # linear copy of the mesh (same points, cells and data arrays) + outer surface (prepared in the background)
+        self._prepared = prepared or self.prepare(h5)
+        self.grid = self._prepared["grid"]
 
         self.cmap = cmap
         self.show_edges = show_edges
@@ -127,12 +86,17 @@ class H5ResultViewer:
         self.step = 0                                   # index of the displayed result step
         self.cmode = "amplitude"                        # shown part of complex results
         self.phase = 0.0                                # phase angle of the deformed shape of complex results
+        self.anim_phase = 0.0                           # phase of the animation [rad]
         self.deform_pct = 0.0                           # max deformation in % of the model size (at slider change)
         self.scale = 0.0                                # deformation scale factor (kept when the step changes)
         self.selected = None                            # (node index, cell index or None)
         self.curves = []                                # curves in the graph
+        self.highlight_mode = None                      # mode number highlighted in the graph (tab Modes)
         self._history_cache = {}
         self.model_size = self.grid.length              # diagonal of the bounding box
+        self.random_tab = None                          # tab "Random" (frequency response)
+        self.modes_tab = None                           # tab "Modes" (eigenvalue summary)
+        self._disposed = False
 
         self.section = False                            # section on / off
         self.slice_only = False                         # True = only the section plane, False = cut model
@@ -140,27 +104,34 @@ class H5ResultViewer:
         self.normal = np.array([0.0, 0.0, 1.0])         # section plane, normal points to the removed part
         self.origin = np.array(self.grid.center, dtype=float)
 
-        # window: panel | (3D view / graph)
-        self.window = MainWindow()
-        self.window.setWindowTitle(f"Nastran results - {h5.file_path.name}")
-        self.window.resize(*window_size)
+        if window is None:
+            from visualization.viewer_window import ViewerWindow
+            window = ViewerWindow(window_size=window_size)
+        self.window = window
+        self.tasks = TaskRunner()                       # background work (min / max of results, random RMS)
+        self.tasks.on_progress = getattr(window, "show_task_progress", None)
+        self.tasks.on_finished = getattr(window, "task_finished", None)
+        self.anim_timer = QtCore.QTimer()
+        self.anim_timer.setInterval(40)
+        self.anim_timer.timeout.connect(lambda: safe_call(self._animation_frame))
+        self._anim_t0 = 0.0
+
+        # layout: panel | (3D view / graph)
         self.pl = QtInteractor()
-        self.window.signal_close.connect(self.pl.close)
-        if hasattr(h5, "close"):
-            self.window.signal_close.connect(h5.close)
         self.pl.set_background("white")
         splitter = QtWidgets.QSplitter(HORIZONTAL)
-        splitter.addWidget(self._build_panel())
+        splitter.addWidget(self._build_side())
         right = QtWidgets.QSplitter(VERTICAL)
         right.addWidget(self.pl.interactor)
         self.graph_widget = self._build_graph()
         if self.graph_widget is not None:
             right.addWidget(self.graph_widget)
-            right.setSizes([window_size[1] - 300, 300])
+            height = max(window.height(), 600)
+            right.setSizes([height - 330, 300])
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([440, window_size[0] - 440])
-        self.window.setCentralWidget(splitter)
+        splitter.setSizes([460, max(window.width(), 1000) - 460])
+        self.widget = splitter
 
         self.actor = None
         self._bar_title = None
@@ -169,8 +140,66 @@ class H5ResultViewer:
         self._build_scene()
         self._update_tree_ranges()
         self._sync_controls()
+        self._prepared = None
+        window.set_viewer(self)
+
+    @classmethod
+    def prepare(cls, h5, progress=None):
+        """
+        Preparation of the 3D view which may take long for big models - it can run in a background thread
+        (no Qt / rendering): linear copy of the mesh, outer surface, outline, values of the first result.
+        """
+        report = progress or (lambda fraction, text: None)
+        report(0.85, "preparing the 3D view")
+        grid = pv.UnstructuredGrid()
+        grid.ShallowCopy(h5.to_pyvista(linear=True))
+        grid.cell_data["_cell_index"] = np.arange(grid.n_cells)
+        surface = cls._surface(grid, pass_ids=True)
+        outline = cls._feature_edges(surface)
+        report(0.95, "reading the first result")
+        if h5.results:
+            h5.values(h5.results[0][0], 0, "amplitude")         # -> cache
+        h5.deformation_vectors(0)
+        return dict(grid=grid, surface=surface, outline=outline)
+
+    def title(self):
+        """Title of the window."""
+        return f"Nastran results - {self.h5.file_path.name}"
+
+    def _series(self, step):
+        """Course (subcase, kind, ...) the step belongs to - steps of one course make a history graph."""
+        s = self.steps[step]
+        return s.get("series", (s["subcase"], s["kind"]))
+
+    def _series_steps(self, step=None):
+        series = self._series(self.step if step is None else step)
+        return [i for i in range(len(self.steps)) if self._series(i) == series]
+
+    def _status(self, text):
+        if hasattr(self.window, "status"):
+            self.window.status(text)
 
     # ================================================================================================= Qt panel
+    def _build_side(self):
+        """Left side: panel "Results" (+ tabs "Random" / "Modes" if the results allow it)."""
+        panel = self._build_panel()
+        from visualization.dynamics_tabs import ModesTab, RandomTab
+
+        tabs = []
+        if RandomTab.available(self.h5):
+            self.random_tab = RandomTab(self)
+            tabs.append((self.random_tab.widget, "Random"))
+        if ModesTab.available(self.h5):
+            self.modes_tab = ModesTab(self)
+            tabs.append((self.modes_tab.widget, "Modes"))
+        if not tabs:
+            return panel
+        self.side_tabs = QtWidgets.QTabWidget()
+        self.side_tabs.addTab(panel, "Results")
+        for widget, label in tabs:
+            self.side_tabs.addTab(widget, label)
+        return self.side_tabs
+
     def _build_panel(self):
         panel = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(panel)
@@ -232,19 +261,7 @@ class H5ResultViewer:
         self.tree.setUniformRowHeights(True)
         self.tree.setMinimumHeight(140)
         self._tree_items = {}
-        parents = {}
-        bold = QtGui.QFont()
-        bold.setBold(True)
-        for i, (name, location) in enumerate(self.results):
-            group, item_label = self.h5.result_meta.get(name, ("Other", name))
-            if group not in parents:
-                parents[group] = self._group_item(self.tree, group, bold)
-            item = QtWidgets.QTreeWidgetItem(parents[group], [item_label, "", ""])
-            item.setData(0, USER_ROLE, i)
-            kind = "nodal" if location == "point" else "element"
-            item.setToolTip(0, f"{name}  ({kind} values" + (", complex)" if self.h5.is_complex(name) else ")"))
-            self._tree_items[i] = item
-        self.tree.expandAll()
+        self._rebuild_tree()
         self.tree.currentItemChanged.connect(self._on_tree_item)
         layout.addWidget(self.tree, stretch=1)
 
@@ -261,13 +278,27 @@ class H5ResultViewer:
         self.deform_slider.valueChanged.connect(lambda v: self._on_deform_slider(v / 10.0))
         self.deform_label = QtWidgets.QLabel()
         deform_caption = QtWidgets.QLabel("Deformation:")
+        self.animate_button = QtWidgets.QPushButton("Animate")
+        self.animate_button.setCheckable(True)
+        self.animate_button.setToolTip("Animation of the deformed shape: modes and real results U * cos(phi), "
+                                       "frequency response Re(U * exp(i phi)), phi = 0 - 360 deg")
+        self.animate_button.toggled.connect(lambda on: self.set_animation(on))
+        self.period_spin = QtWidgets.QDoubleSpinBox()
+        self.period_spin.setRange(0.3, 20.0)
+        self.period_spin.setSingleStep(0.5)
+        self.period_spin.setValue(2.0)
+        self.period_spin.setSuffix(" s / cycle")
+        self.period_spin.setToolTip("Duration of one cycle of the animation")
         grid.addWidget(self.edges_check, 0, 0)
         grid.addWidget(self.local_check, 0, 1)
         grid.addWidget(deform_caption, 1, 0)
         grid.addWidget(self.deform_slider, 1, 1)
         grid.addWidget(self.deform_label, 2, 0, 1, 2)
-        if self.h5.get_deformation(0) is None:
-            for widget in (deform_caption, self.deform_slider, self.deform_label):
+        grid.addWidget(self.animate_button, 3, 0)
+        grid.addWidget(self.period_spin, 3, 1)
+        if self.h5.deformation_vectors(0) is None:
+            for widget in (deform_caption, self.deform_slider, self.deform_label, self.animate_button,
+                           self.period_spin):
                 widget.hide()                                   # e.g. input model (BDF) without results
         layout.addWidget(display)
 
@@ -338,22 +369,61 @@ class H5ResultViewer:
 
         # ---- view buttons
         buttons = QtWidgets.QHBoxLayout()
-        for text, callback in (("Reset view", lambda: self.pl.reset_camera()),
-                               ("Isometric", lambda: self.pl.view_isometric()),
-                               ("Screenshot...", self._on_screenshot)):
+        for text, callback, tip in (
+                ("Reset view", lambda: self.pl.reset_camera(), "Whole model in the view (key R)"),
+                ("Isometric", lambda: self.pl.view_isometric(), "Isometric view (key V)"),
+                ("Save view", lambda: self.window.save_view(),
+                 "Save the camera view for this file - restored when the file is opened again (File menu)"),
+                ("Screenshot...", self._on_screenshot, "Save the 3D view as PNG")):
             button = QtWidgets.QPushButton(text)
-            button.clicked.connect(lambda checked=False, c=callback: c())
+            button.setToolTip(tip)
+            button.clicked.connect(lambda checked=False, c=callback: safe_call(c))
             buttons.addWidget(button)
         layout.addLayout(buttons)
 
         help_label = QtWidgets.QLabel("3D view: left mouse = rotate, middle / Shift+left = pan, wheel = zoom, "
                                       "double-click = select node; keys I = select node, Left/Right = result, "
                                       "PageUp/PageDown = step, X/Y/Z = section, N = flip, R = reset view, "
-                                      "V = isometric")
+                                      "V = isometric. Another file: File > Open or drag & drop.")
         help_label.setWordWrap(True)
         help_label.setStyleSheet("color: gray")
         layout.addWidget(help_label)
         return panel
+
+    def _rebuild_tree(self):
+        """(Re)fills the table of results (groups -> results); min / max are filled in the background."""
+        self.tree.blockSignals(True)
+        old = {i: (item.text(1), item.text(2)) for i, item in self._tree_items.items()}
+        self.tree.clear()
+        self._tree_items = {}
+        parents = {}
+        bold = QtGui.QFont()
+        bold.setBold(True)
+        for i, (name, location) in enumerate(self.results):
+            group, item_label = self.h5.result_meta.get(name, ("Other", name))
+            if group not in parents:
+                parents[group] = self._group_item(self.tree, group, bold)
+            item = QtWidgets.QTreeWidgetItem(parents[group], [item_label, *old.get(i, ("", ""))])
+            item.setData(0, USER_ROLE, i)
+            kind = "nodal" if location == "point" else "element"
+            item.setToolTip(0, f"{name}  ({kind} values" + (", complex)" if self.h5.is_complex(name) else ")"))
+            self._tree_items[i] = item
+        self.tree.expandAll()
+        if self.idx in self._tree_items:
+            self.tree.setCurrentItem(self._tree_items[self.idx])
+        self.tree.blockSignals(False)
+
+    def results_changed(self, select=None):
+        """Results were added or changed (e.g. random RMS maps): table of results, 3D view, min / max."""
+        if select is not None:
+            names = [name for name, _ in self.results]
+            if select in names:
+                self.idx = names.index(select)
+        self._rebuild_tree()
+        self._history_cache.clear()
+        self._refresh()
+        self._update_tree_ranges()
+        self.pl.render()
 
     def _preview_step(self, step):
         """Shows the label of the step while the slider is dragged (the step is loaded after releasing it)."""
@@ -369,13 +439,30 @@ class H5ResultViewer:
         return item
 
     def _update_tree_ranges(self):
-        """Min / max of all results in the current step (and complex part)."""
-        for i, (name, _) in enumerate(self.results):
-            values = self._values(i)
-            finite = values[np.isfinite(values)]
-            low, high = (f"{finite.min():.4g}", f"{finite.max():.4g}") if finite.size else ("-", "-")
-            self._tree_items[i].setText(1, low)
-            self._tree_items[i].setText(2, high)
+        """Min / max of all results in the current step (and complex part) - computed in the background."""
+        if self._disposed:
+            return
+        h5, results, step, cmode = self.h5, list(self.results), self.step, self.cmode
+
+        def work(task):
+            ranges = []
+            for i, (name, _) in enumerate(results):
+                task.check()
+                values = np.asarray(h5.values(name, step, cmode), dtype=float)
+                finite = values[np.isfinite(values)]
+                ranges.append((i, float(finite.min()), float(finite.max())) if finite.size else (i, None, None))
+            return ranges
+
+        self.tasks.start("ranges", work, done=self._set_tree_ranges)
+
+    def _set_tree_ranges(self, ranges):
+        if self._disposed:
+            return
+        for i, low, high in ranges:
+            item = self._tree_items.get(i)
+            if item is not None:
+                item.setText(1, "-" if low is None else f"{low:.4g}")
+                item.setText(2, "-" if high is None else f"{high:.4g}")
         for column in range(3):
             self.tree.resizeColumnToContents(column)
 
@@ -388,7 +475,8 @@ class H5ResultViewer:
         self.section_group.setChecked(self.section)
         self.slice_check.setChecked(self.slice_only)
         self.section_slider.setValue(int(round(self._section_fraction() * 10)))
-        self.tree.setCurrentItem(self._tree_items[self.idx])
+        if self.idx in self._tree_items:
+            self.tree.setCurrentItem(self._tree_items[self.idx])
         if self.steps:
             self.step_combo.setCurrentIndex(self.step)
             self.step_slider.setValue(self.step)
@@ -433,6 +521,16 @@ class H5ResultViewer:
         top = QtWidgets.QHBoxLayout()
         self.graph_label = QtWidgets.QLabel()
         top.addWidget(self.graph_label, stretch=1)
+        self.psd_check = QtWidgets.QCheckBox("Response PSD")
+        self.psd_check.setToolTip("Random vibration: response PSD of the current result in the selected node "
+                                  "(input PSD in the tab Random) instead of the frequency response")
+        self.psd_check.toggled.connect(lambda on: self._update_graph())
+        self.psd_check.setVisible(self.random_tab is not None)
+        self.modes_check = QtWidgets.QCheckBox("Natural frequencies")
+        self.modes_check.setToolTip("Natural frequencies (eigenvalue summary) as vertical lines")
+        self.modes_check.setChecked(True)
+        self.modes_check.toggled.connect(lambda on: self._update_graph())
+        self.modes_check.setVisible(bool(getattr(self.h5, "modes", None)))
         self.hold_check = QtWidgets.QCheckBox("Hold curves")
         self.hold_check.setToolTip("Keep the curves of previously selected nodes / results (comparison)")
         self.hold_check.toggled.connect(lambda on: self._update_graph())
@@ -442,11 +540,12 @@ class H5ResultViewer:
         clear.clicked.connect(lambda checked=False: self._clear_curves())
         export = QtWidgets.QPushButton("Export CSV...")
         export.clicked.connect(lambda checked=False: self._on_export_csv())
-        for w in (self.hold_check, self.logy_check, clear, export):
+        for w in (self.psd_check, self.modes_check, self.hold_check, self.logy_check, clear, export):
             top.addWidget(w)
         self.figure = Figure(figsize=(8, 2.6))
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.axes = self.figure.add_subplot(111)
+        self._twin = None
         self.graph_toolbar = NavigationToolbar2QT(self.canvas, widget)
         self.canvas.mpl_connect("button_press_event", self._on_graph_click)
         layout.addLayout(top)
@@ -455,7 +554,7 @@ class H5ResultViewer:
         return widget
 
     def _history(self, name, index):
-        key = (name, index, self.steps[self.step]["subcase"], self.steps[self.step]["kind"], self.cmode)
+        key = (name, index, self._series(self.step), self.cmode)
         if key not in self._history_cache:
             self._history_cache[key] = self.h5.history(name, index, self.step, self.cmode)
         return self._history_cache[key]
@@ -464,21 +563,75 @@ class H5ResultViewer:
         self.curves = []
         self._update_graph()
 
+    def _graph_kind(self):
+        """"psd" = response PSD of a random vibration, "history" = result over time / frequency / modes."""
+        rt = self.random_tab
+        if rt is None or getattr(self, "graph_widget", None) is None or not self.results:
+            return "history"
+        name = self.results[self.idx][0]
+        if rt.is_random_result(name) or (self.psd_check.isChecked() and rt.supports(name)):
+            return "psd"
+        return "history"
+
+    def _frequency_axis(self, kind):
+        return kind == "psd" or (bool(self.steps) and self.steps[self.step]["kind"] == "frequency")
+
+    def _graph_x_range(self, kind):
+        if kind == "psd":
+            response = self.random_tab.response()
+            if response is not None:
+                return response.f_range
+        xs = [c["x"] for c in self.curves if len(c["x"])]
+        if xs:
+            return float(min(np.nanmin(x) for x in xs)), float(max(np.nanmax(x) for x in xs))
+        if self.steps:
+            x = [self.steps[i]["x"] for i in self._series_steps()]
+            return float(min(x)), float(max(x))
+        return None
+
+    def _draw_mode_lines(self, ax, kind, x_range):
+        """Natural frequencies (eigenvalue summary) as vertical lines in a frequency graph."""
+        modes = getattr(self.h5, "modes", None)
+        if not modes or x_range is None or not self.modes_check.isChecked() or not self._frequency_axis(kind):
+            return
+        freq, numbers = modes["freq"], modes["mode"]
+        inside = (freq >= x_range[0]) & (freq <= x_range[1])
+        label_all = np.count_nonzero(inside) <= 40
+        transform = ax.get_xaxis_transform()
+        for f, m in zip(freq[inside], numbers[inside]):
+            highlighted = self.highlight_mode is not None and int(m) == self.highlight_mode
+            color = "tab:purple" if highlighted else "tab:green"
+            ax.axvline(f, color=color, linewidth=1.6 if highlighted else 0.7, linestyle="-" if highlighted else ":",
+                       alpha=0.9 if highlighted else 0.6, zorder=0)
+            if label_all or highlighted:
+                text = f" mode {m}: {f:.4g} Hz" if highlighted else f" {m}"
+                ax.text(f, 0.98, text, transform=transform, fontsize=7 if highlighted else 6, color=color,
+                        rotation=90, ha="right", va="top", clip_on=True)
+
     def _update_graph(self):
-        if self.graph_widget is None:
+        if getattr(self, "graph_widget", None) is None or self._disposed:
             return
         name, location = self.results[self.idx]
+        kind = self._graph_kind()
         current = None
         if self.selected is not None:
             node, cell = self.selected
             index = node if location == "point" else cell
             if index is not None:
-                history = self._history(name, index)
-                if history is not None:
-                    steps, x, y = history
-                    where = self._where_text(node, cell, location)
-                    label = f"{where}: {name}" + (f" [{self.cmode}]" if self.h5.is_complex(name) else "")
-                    current = dict(key=(name, index, self.cmode), label=label, steps=steps, x=x, y=y)
+                where = self._where_text(node, cell, location)
+                if kind == "psd":
+                    curve = self.random_tab.psd_curve(name, index)
+                    if curve is not None:
+                        current = dict(key=("psd", name, index, curve["id"]), label=f"{where}: {curve['label']}",
+                                       steps=curve["steps"], x=curve["x"], y=curve["y"], kind="psd",
+                                       unit=curve["unit"])
+                else:
+                    history = self._history(name, index)
+                    if history is not None:
+                        steps, x, y = history
+                        current = dict(key=("history", name, index, self.cmode), label=f"{where}: {self._title(name)}",
+                                       steps=steps, x=x, y=y, kind="history", unit=None)
+        self.curves = [c for c in self.curves if c["kind"] == kind]
         if current is not None:
             if self.hold_check.isChecked():
                 if current["key"] not in [c["key"] for c in self.curves]:
@@ -488,41 +641,86 @@ class H5ResultViewer:
         elif not self.hold_check.isChecked():
             self.curves = []
 
-        ax = self.axes
-        ax.clear()
+        self.figure.clear()
+        ax = self.axes = self.figure.add_subplot(111)
+        self._twin = None
         for curve in self.curves:
             ax.plot(curve["x"], curve["y"], "-", marker=".", markersize=3, linewidth=1.2, label=curve["label"])
             if self.step in curve["steps"]:                     # marker = current step
                 i = int(np.flatnonzero(curve["steps"] == self.step)[0])
-                ax.plot(curve["x"][i], curve["y"][i], "o", color="red", markersize=6)
+                if np.isfinite(curve["y"][i]) and (kind != "psd" or curve["y"][i] > 0):
+                    ax.plot(curve["x"][i], curve["y"][i], "o", color="red", markersize=6)
+        x_range = self._graph_x_range(kind)
         if self.steps:
-            ax.axvline(self.steps[self.step]["x"], color="red", linewidth=0.8, linestyle="--")
-        ax.set_xlabel(self.h5.step_axis(self.step))
-        ax.set_ylabel(name + (f" [{self.cmode}]" if self.h5.is_complex(name) else ""), fontsize=8)
-        if self.logy_check.isChecked() and any(np.nanmax(c["y"]) > 0 for c in self.curves if c["y"].size):
+            x_step = self.steps[self.step]["x"]
+            if x_range is None or x_range[0] <= x_step <= x_range[1]:
+                ax.axvline(x_step, color="red", linewidth=0.8, linestyle="--")
+        if kind == "psd":
+            self._draw_input_psd(ax)
+            ax.set_xscale("log")
             ax.set_yscale("log", nonpositive="mask")
+            ax.set_xlabel("Frequency [Hz]")
+            unit = self.curves[-1]["unit"] if self.curves else "g"
+            ax.set_ylabel(f"PSD [{unit or '(model unit)'}$^2$/Hz]", fontsize=8)
+            if x_range is not None and x_range[1] > x_range[0]:
+                ax.set_xlim(*x_range)
+        else:
+            ax.set_xlabel(self.h5.step_axis(self.step))
+            ax.set_ylabel(self._title(name), fontsize=8)
+            if self.logy_check.isChecked() and any(np.nanmax(c["y"]) > 0 for c in self.curves if c["y"].size):
+                ax.set_yscale("log", nonpositive="mask")
+        self._draw_mode_lines(ax, kind, x_range)
         ax.grid(True, which="both", alpha=0.3)
         ax.tick_params(labelsize=8)
-        if len(self.curves) > 1:
-            ax.legend(fontsize=7)
+        handles, labels = ax.get_legend_handles_labels()
+        if self._twin is not None:
+            more = self._twin.get_legend_handles_labels()
+            handles, labels = handles + more[0], labels + more[1]
+        if len(handles) > 1 or (kind == "psd" and handles):
+            ax.legend(handles, labels, fontsize=7)
         if self.curves:
-            self.graph_label.setText(f"<b>{self.curves[-1]['label']}</b>  (click into the graph = show that step)")
+            hint = "response PSD, click = show that frequency" if kind == "psd" else "click into the graph = show that step"
+            self.graph_label.setText(f"<b>{self.curves[-1]['label']}</b>  ({hint})")
+        elif kind == "psd" and self.random_tab.response() is None:
+            self.graph_label.setText(f"Random response is not available: {self.random_tab.error_text()}")
         elif self.selected is None:
             self.graph_label.setText("Select a node (double-click in 3D, key I or node ID) to see the course of "
-                                     "the current result over the steps.")
+                                     "the current result" + (" (response PSD)." if kind == "psd" else
+                                                             " over the steps."))
         else:
             self.graph_label.setText(f"No course of {name} in the selected node / element.")
-        self.figure.tight_layout()
+        try:
+            self.figure.tight_layout()
+        except Exception:  # noqa: BLE001  (e.g. too small canvas)
+            pass
         self.canvas.draw_idle()
 
+    def _draw_input_psd(self, ax):
+        """Input PSD: in the same axes for accelerations in g (same unit), else on a secondary axis."""
+        f, w = self.random_tab.input_curve()
+        if f is None:
+            return
+        same_unit = all(c["unit"] == "g" for c in self.curves)
+        target = ax if same_unit else ax.twinx()
+        if target is not ax:
+            self._twin = target
+            target.set_yscale("log", nonpositive="mask")
+            target.set_ylabel("Input PSD [g$^2$/Hz]", fontsize=8, color="gray")
+            target.tick_params(labelsize=7, colors="gray")
+        target.plot(f, w, "--", color="gray", linewidth=1.0, label=f"input PSD ({self.random_tab.input_text()})")
+
     def _on_graph_click(self, event):
-        if event.inaxes is not self.axes or event.button != 1 or event.xdata is None:
+        if event.inaxes is None or event.inaxes not in (self.axes, self._twin) or event.button != 1 \
+                or event.xdata is None:
             return
         if str(getattr(self.graph_toolbar, "mode", "")):        # zoom / pan of the graph is active
             return
-        current = self.steps[self.step]
-        candidates = [i for i, s in enumerate(self.steps) if s["subcase"] == current["subcase"]
-                      and s["kind"] == current["kind"]]
+        candidates = self._series_steps()
+        if self._graph_kind() == "psd":
+            response = self.random_tab.response()
+            candidates = list(response.steps) if response is not None else candidates
+        if not candidates:
+            return
         x = np.array([self.steps[i]["x"] for i in candidates])
         self.set_step(candidates[int(np.argmin(np.abs(x - event.xdata)))])
 
@@ -537,9 +735,10 @@ class H5ResultViewer:
 
     def export_curves(self, path):
         """Saves the curves of the graph to a CSV file (x, y of every curve)."""
+        x_label = "Frequency [Hz]" if self.curves and self.curves[0]["kind"] == "psd" else self.h5.step_axis(self.step)
         with open(path, "w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file, delimiter=";")
-            writer.writerow(sum([[self.h5.step_axis(self.step), c["label"]] for c in self.curves], []))
+            writer.writerow(sum([[x_label, c["label"]] for c in self.curves], []))
             for i in range(max(len(c["x"]) for c in self.curves)):
                 row = []
                 for c in self.curves:
@@ -571,11 +770,11 @@ class H5ResultViewer:
 
     def _build_surface(self):
         """Outer surface + outline of the whole model (geometry only, results are mapped onto it)."""
-        self.surface = self._surface(self.grid, pass_ids=True)
+        self.surface = self._prepared["surface"]
         self.surface_points0 = self.surface.points.copy()
         self.surface_ids = np.asarray(self.surface.point_data["vtkOriginalPointIds"])
         self.surface_cells = np.asarray(self.surface.cell_data["_cell_index"])
-        self.outline = self._feature_edges(self.surface)        # model outline shown with sections
+        self.outline = self._prepared["outline"]                # model outline shown with sections
         self.outline_points0 = self.outline.points.copy()
         self.outline_ids = np.asarray(self.outline.point_data["vtkOriginalPointIds"])
         self.outline_actor = self.pl.add_mesh(self.outline, color="gray", opacity=0.5, line_width=1,
@@ -583,22 +782,34 @@ class H5ResultViewer:
         self.outline_actor.SetVisibility(False)
 
     def _load_step(self):
-        """Deformation vectors of the current step."""
-        vectors = self.h5.get_deformation(self.step, self.phase)
+        """Deformation vectors of the current step (complex for frequency response)."""
+        vectors = self.h5.deformation_vectors(self.step)
         if vectors is None:
             vectors = np.zeros((self.grid.n_points, 3))
-        self.U = np.nan_to_num(vectors)
-        self.u_max = float(np.linalg.norm(self.U, axis=1).max())
+        vectors = np.nan_to_num(np.asarray(vectors))
+        self.U_complex = bool(np.iscomplexobj(vectors))
+        self.Uc = vectors.astype(complex)
+        self.u_max = float(np.sqrt((np.abs(self.Uc) ** 2).sum(axis=1)).max()) if len(self.Uc) else 0.0
+        self.U = self._deformed(self.Uc, animated=False)       # shape at the deformation phase (probe, labels)
+
+    def _phase_angle(self, animated=True):
+        """Phase [rad] of the shown deformed shape: deformation phase of complex results + animation."""
+        phase = np.radians(self.phase) if self.U_complex else 0.0
+        return phase + (self.anim_phase if animated else 0.0)
+
+    def _deformed(self, vectors, animated=True):
+        """Real part of U * exp(i * phase) (real results: U * cos(animation phase))."""
+        return (vectors * np.exp(1j * self._phase_angle(animated))).real
 
     def _update_mesh(self):
         """Mesh to display (outer surface / surface of the cut model / section plane only) with the values of
-        the current result ("_value") and the deformation vectors ("_U")."""
+        the current result ("_value") and the (complex) deformation vectors."""
         name, location = self.results[self.idx]
         values = self._values()
         if not self.section:
             self.mesh = self.surface
             self.mesh_points0 = self.surface_points0
-            self.mesh_U = self.U[self.surface_ids]
+            self.mesh_Uc = self.Uc[self.surface_ids]
             self.mesh.point_data.pop("_value", None)
             self.mesh.cell_data.pop("_value", None)
             if location == "point":
@@ -609,7 +820,8 @@ class H5ResultViewer:
 
         work = pv.UnstructuredGrid()
         work.ShallowCopy(self.grid)
-        work.point_data["_U"] = self.U
+        work.point_data["_Ure"] = self.Uc.real
+        work.point_data["_Uim"] = self.Uc.imag
         if location == "point":
             work.point_data["_value"] = values
         else:
@@ -631,7 +843,10 @@ class H5ResultViewer:
             clipper.Update()
             self.mesh = self._surface(clipper.GetOutput())
         self.mesh_points0 = self.mesh.points.copy()
-        self.mesh_U = np.asarray(self.mesh.point_data["_U"]) if self.mesh.n_points else np.zeros((0, 3))
+        if self.mesh.n_points:
+            self.mesh_Uc = np.asarray(self.mesh.point_data["_Ure"]) + 1j * np.asarray(self.mesh.point_data["_Uim"])
+        else:
+            self.mesh_Uc = np.zeros((0, 3), dtype=complex)
 
     # ================================================================================================= 3D scene
     def _build_scene(self):
@@ -670,6 +885,13 @@ class H5ResultViewer:
         name, _ = self.results[self.idx if idx is None else idx]
         return np.asarray(self.h5.values(name, self.step, self.cmode), dtype=float)
 
+    def _title(self, name):
+        """Result name + complex part (+ sigma level of random RMS maps)."""
+        title = name + (f" [{self.cmode}]" if self.h5.is_complex(name) else "")
+        if self.random_tab is not None:
+            title += self.random_tab.title_suffix(name)
+        return title
+
     def _shown_values(self):
         """Finite values of the current result on the displayed mesh (outer surface / cut model / slice)."""
         name, location = self.results[self.idx]
@@ -696,7 +918,7 @@ class H5ResultViewer:
             self.step = step
             self._load_step()
             self._refresh()
-            QtCore.QTimer.singleShot(0, self._update_tree_ranges)
+            self._update_tree_ranges()
         self.pl.render()
 
     def set_complex_mode(self, mode):
@@ -710,9 +932,9 @@ class H5ResultViewer:
     def set_phase(self, phase):
         """Phase angle [deg] of the deformed shape of complex results."""
         self.phase = float(phase)
-        self._load_step()
-        self._update_mesh()
+        self.U = self._deformed(self.Uc, animated=False)
         self._apply_deformation()
+        self._update_info()
         self._update_selection()
         self.pl.render()
 
@@ -741,7 +963,10 @@ class H5ResultViewer:
             self.actor = None
 
         if self.mesh.n_cells > 0:                       # section outside of the model -> nothing to show
-            title = name + (f" [{self.cmode}]" if self.h5.is_complex(name) else "")
+            title = self._title(name)
+            suffix = self.random_tab.title_suffix(name) if self.random_tab is not None else ""
+            if suffix:                                  # random RMS map: sigma level on the 2nd line
+                title = title[:-len(suffix)] + "\n" + suffix.strip()
             self._bar_title = title + "\n"              # new line = space between the title and the top label
             # IDs, codes, ... -> one color per integer value (+ text labels of the values if available)
             is_id = name in getattr(self.h5, "categorical_results", {"Property ID"})
@@ -782,9 +1007,44 @@ class H5ResultViewer:
         self.pl.render()
 
     def _apply_deformation(self):
+        rotation = np.exp(1j * self._phase_angle())
         if self.mesh.n_points > 0:
-            self.mesh.points = self.mesh_points0 + self.scale * self.mesh_U
-        self.outline.points = self.outline_points0 + self.scale * self.U[self.outline_ids]
+            self.mesh.points = self.mesh_points0 + self.scale * (self.mesh_Uc * rotation).real
+        self.outline.points = self.outline_points0 + self.scale * (self.Uc[self.outline_ids] * rotation).real
+
+    def set_animation(self, on=True):
+        """Animation of the deformed shape (phase 0 - 360 deg, period by the spin box) on / off."""
+        on = bool(on) and not self._disposed
+        if on and self.u_max == 0:
+            on = False
+            self._status("Nothing to animate - no displacement in this step")
+        if on and self.scale == 0:                              # no deformation shown yet -> 5 % of the model
+            pct = self.deform_pct if self.deform_pct > 0 else 5.0
+            self.deform_slider.blockSignals(True)
+            self.deform_slider.setValue(int(round(pct * 10)))
+            self.deform_slider.blockSignals(False)
+            self._on_deform_slider(pct)
+        self.animate_button.blockSignals(True)
+        self.animate_button.setChecked(on)
+        self.animate_button.blockSignals(False)
+        if on:
+            self._anim_t0 = time.perf_counter()
+            self.anim_timer.start()
+        else:
+            self.anim_timer.stop()
+            if self.anim_phase != 0.0 and not self._disposed:
+                self.anim_phase = 0.0
+                self._apply_deformation()
+                self.pl.render()
+
+    def _animation_frame(self):
+        if self._disposed:
+            self.anim_timer.stop()
+            return
+        period = max(self.period_spin.value(), 0.1)
+        self.anim_phase = 2.0 * np.pi * (((time.perf_counter() - self._anim_t0) / period) % 1.0)
+        self._apply_deformation()
+        self.pl.render()
 
     # ================================================================================================= section
     def _model_range(self, normal):
@@ -879,7 +1139,7 @@ class H5ResultViewer:
         cell = int(pv.wrap(picker.GetDataSet()).cell_data["_cell_index"][picker.GetCellId()])
         # nearest node of the picked element (in the current, possibly deformed shape)
         nodes = np.asarray(self.grid.get_cell(cell).point_ids)
-        positions = self.grid.points[nodes] + self.scale * self.U[nodes]
+        positions = self.grid.points[nodes] + self.scale * self._deformed(self.Uc[nodes])
         distance = np.linalg.norm(positions - np.array(picker.GetPickPosition()), axis=1)
         self.select(int(nodes[np.argmin(distance)]), cell)
 
@@ -984,7 +1244,7 @@ class H5ResultViewer:
         name, location = self.results[self.idx]
         values = self._values()
         lines = [f"{self.h5.file_path.name}", self.steps[self.step]["label"] if self.steps else ""]
-        title = name + (f" [{self.cmode}]" if self.h5.is_complex(name) else "")
+        title = self._title(name)
         if name in getattr(self.h5, "categorical_results", {"Property ID"}):
             labels = getattr(self.h5, "result_annotations", {}).get(name, {})
             unique = np.unique(values[np.isfinite(values)]).astype(int)
@@ -1011,7 +1271,7 @@ class H5ResultViewer:
                 lines.append("shown part: nothing (plane outside of the model)")
         if self.scale > 0:
             lines.append(f"Deformation scale = {self.scale:.4g}x"
-                         + (f", phase {self.phase:.0f} deg" if self.has_complex else ""))
+                         + (f", phase {self.phase:.0f} deg" if self.U_complex else ""))
         if self.selected is not None:
             node, cell = self.selected
             index = node if location == "point" else cell
@@ -1020,15 +1280,51 @@ class H5ResultViewer:
         self.pl.add_text("\n".join(line for line in lines if line), position="upper_left", font_size=10,
                          color="black", name="info")
 
+    # ================================================================================================= camera
+    def camera_view(self):
+        """Camera of the 3D view as a dict (saved in the settings)."""
+        camera = self.pl.renderer.GetActiveCamera()
+        return dict(position=list(camera.GetPosition()), focal_point=list(camera.GetFocalPoint()),
+                    view_up=list(camera.GetViewUp()), view_angle=camera.GetViewAngle(),
+                    parallel=bool(camera.GetParallelProjection()), parallel_scale=camera.GetParallelScale())
+
+    def set_camera_view(self, view):
+        """Restores a camera view saved by camera_view()."""
+        camera = self.pl.renderer.GetActiveCamera()
+        camera.SetPosition(*view["position"])
+        camera.SetFocalPoint(*view["focal_point"])
+        camera.SetViewUp(*view["view_up"])
+        if "view_angle" in view:
+            camera.SetViewAngle(view["view_angle"])
+        camera.SetParallelProjection(bool(view.get("parallel", False)))
+        if "parallel_scale" in view:
+            camera.SetParallelScale(view["parallel_scale"])
+        self.pl.renderer.ResetCameraClippingRange()
+        self.pl.render()
+
     # ================================================================================================= run
     def show(self):
         """Opens the window and runs the Qt event loop (returns after the window is closed)."""
         self.window.show()
         self.pl.render()
-        run = getattr(self.app, "exec", None) or getattr(self.app, "exec_")
-        run()
+        run_app()
 
     def screenshot(self, file_path):
         """Saves the 3D view to a PNG file."""
         self.pl.render()
         self.pl.screenshot(str(file_path))
+
+    def dispose(self):
+        """Stops the animation and background tasks, closes the 3D view and the H5 file (another file is opened
+        in the window or the window is closed)."""
+        if self._disposed:
+            return
+        self._disposed = True
+        self.anim_timer.stop()
+        self.tasks.stop(wait=2.0)
+        try:
+            self.pl.close()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        if hasattr(self.h5, "close"):
+            safe_call(self.h5.close)

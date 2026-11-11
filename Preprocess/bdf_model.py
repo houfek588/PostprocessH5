@@ -56,30 +56,38 @@ class BdfModel(NastranMesh):
     MIN_SCALED_JACOBIAN = 0.2
     MAX_EDGE_RATIO = 10.0
 
-    def __init__(self, file_path, verbose=True, coincident_tolerance=None):
+    def __init__(self, file_path, verbose=True, coincident_tolerance=None, progress=None):
         """
         Args:
             file_path: Nastran input file (with or without executive / case control)
             verbose (bool): print progress
             coincident_tolerance (float): distance of coincident nodes, default 1e-6 x model size
+            progress: optional function progress(fraction 0..1 or None = unknown, text) called during loading
+                (background loading in the viewer)
         """
         super().__init__(file_path, verbose)
         from pyNastran.bdf.bdf import BDF
 
+        report = progress or (lambda fraction, text: None)
         self.results_title = "model fields"
         self.coincident_tolerance = coincident_tolerance
         t0 = time.time()
         self._log(f"Reading {self.file_path.name} by pyNastran ...")
+        report(None, "reading the file by pyNastran")
         self.bdf = BDF(debug=None)                                  # debug=None -> warnings and errors only
         self._read_bdf()
         self.read_time = time.time() - t0
 
         self._log("Analysing the model ...")
         self.checks = []                                            # (level, text) - errors / warnings / info
+        report(0.55, "nodes and elements")
         self._read_nodes()
         self._read_elements()
+        report(0.65, "model fields (volume, mass, quality, bodies)")
         self.to_pyvista()                                           # grid + model fields
+        report(0.8, "model entities")
         self._collect_entities()
+        report(0.85, "report")
         self.report = self._make_report()
         self._log(f"Model {self.file_path.name} was analysed ({time.time() - t0:.1f} s)")
 
@@ -165,6 +173,7 @@ class BdfModel(NastranMesh):
 
         def add(name, values, group, item, categorical=False, annotations=None):
             grid.cell_data[name] = values
+            self._grid_values[name] = np.asarray(values, dtype=float)   # values() without VTK (threads)
             self._register(name, "cell", group, item)
             if categorical:
                 self.categorical_results.add(name)
@@ -186,12 +195,7 @@ class BdfModel(NastranMesh):
         type_codes = np.array([codes[n] for n in type_names], dtype=np.int64)
 
         # ---- size, mass
-        sizes = vtkCellSizeFilter()
-        sizes.SetInputData(grid)
-        sizes.ComputeVertexCountOff()
-        sizes.ComputeSumOff()
-        sizes.Update()
-        size_data = pv.wrap(sizes.GetOutput()).cell_data
+        size_data = self._cell_sizes()
         celltypes = np.asarray(grid.celltypes)
         is_solid = np.isin(celltypes, list(SOLID_TYPES))
         is_shell = np.isin(celltypes, list(SHELL_TYPES))
@@ -226,6 +230,24 @@ class BdfModel(NastranMesh):
         add("Element mass", self.element_mass, "Size and mass", "Mass")
         add("Scaled Jacobian", self.scaled_jacobian, "Element quality", "Scaled Jacobian (1 = ideal)")
         add("Edge ratio", self.edge_ratio, "Element quality", "Edge ratio (longest / shortest edge)")
+
+    def _cell_sizes(self, chunk=10000):
+        """Volume / area / length of all cells (vtkCellSizeFilter, exact also for quadratic elements). Computed in
+        chunks of cells - a long VTK call blocks other Python threads (the window while loading in background)."""
+        out = {"Volume": [], "Area": [], "Length": []}
+        for vtk_type, conn in self._cell_blocks:
+            for start in range(0, len(conn), chunk):
+                sub = self._make_grid([(vtk_type, conn[start:start + chunk])], self.points)
+                sizes = vtkCellSizeFilter()
+                sizes.SetInputData(sub)
+                sizes.ComputeVertexCountOff()
+                sizes.ComputeSumOff()
+                sizes.Update()
+                data = pv.wrap(sizes.GetOutput()).cell_data
+                for key in out:
+                    out[key].append(np.asarray(data[key], dtype=float).copy())
+                time.sleep(0)                                       # let the window thread run
+        return {key: np.concatenate(values) if values else np.zeros(0) for key, values in out.items()}
 
     def _element_masses(self, is_solid, is_shell, is_line):
         rho = {mid: float(getattr(mat, "rho", 0.0) or 0.0) for mid, mat in self.bdf.materials.items()}

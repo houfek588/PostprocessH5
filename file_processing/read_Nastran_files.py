@@ -1,10 +1,15 @@
 from pyNastran.bdf.bdf import BDF
 from pyNastran.op2.op2_geom import OP2Geom
 from pyNastran.op2.op2 import OP2
+import threading
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 
 import numpy as np
+
+# PyTables / HDF5 is not thread-safe -> every access to an H5 file goes through this lock (the viewer reads results
+# in background threads: loading of files, min / max of results, random response)
+HDF5_LOCK = threading.RLock()
 
 # h5 files - https://github.com/SteveDoyle2/pyNastran/issues/308
 
@@ -338,7 +343,8 @@ class NastranMesh:
         file_path, node_ids, points, element_ids, property_ids, element_types, to_pyvista(linear),
         results [(name, "point" / "cell")], result_meta {name: (group, item)}, steps [{"label", "kind", ...}],
         values(name, step, mode), history(name, index, step, mode), is_complex(name), step_axis(step),
-        get_deformation(step, phase), categorical_results, result_annotations, results_title
+        get_deformation(step, phase), deformation_vectors(step), modes, categorical_results, result_annotations,
+        results_title, add_static_result(...)
     """
 
     _ELEMENT_TYPES = {
@@ -388,6 +394,12 @@ class NastranMesh:
         # empty list = only one state (input model, static fields)
         self.steps = []
         self.domains = {}           # result domain ID -> label
+        # natural frequencies (eigenvalue summary): {"mode", "freq", "mass", "stiff"} -> arrays, {} = not available
+        self.modes = {}
+        self._static_values = {}    # results added by add_static_result (e.g. random RMS maps)
+        # numpy copies of the result arrays stored in the grid - values() reads them without VTK (VTK objects must
+        # not be used from background threads while the 3D view renders - possible deadlock with newer VTK)
+        self._grid_values = {}
         self._grid = None
         self._grid_linear = None
         self._cell_blocks = []      # [(vtk type, point indices (n, k))]
@@ -557,9 +569,28 @@ class NastranMesh:
         """True for results with complex values (frequency response)."""
         return False
 
+    def add_static_result(self, name, location, group, item, values):
+        """
+        Adds (or replaces) a result which does not depend on the result step (e.g. RMS of a random response).
+
+        Args:
+            name (str): result name, location: "point" (n_nodes values) / "cell" (n_elements values)
+            group, item (str): group and label in the table of results
+        """
+        values = np.asarray(values, dtype=float)
+        if name not in self.result_meta:
+            self._register(name, location, group, item)
+        else:
+            self.result_meta[name] = (group, item)
+        self._static_values[name] = values                     # (save_vtu saves them too)
+
     def values(self, name, step=0, mode="amplitude"):
         """Values of the result `name` in result step `step` (array n_nodes for "point" / n_elements for "cell"
         results). Base class: static arrays stored in the grid (Property ID, model fields of a BDF ...)."""
+        if name in self._static_values:
+            return self._static_values[name]
+        if name in self._grid_values:
+            return self._grid_values[name]
         grid = self.to_pyvista()
         data = grid.point_data if self.result_location(name) == "point" else grid.cell_data
         return np.asarray(data[name], dtype=float)
@@ -579,6 +610,11 @@ class NastranMesh:
         """Translational displacement (n_nodes, 3) in result step `step` (complex results: real part of
         U * exp(i * phase)), None if not available."""
         return None
+
+    def deformation_vectors(self, step=0):
+        """Translational displacement (n_nodes, 3) in result step `step` - complex for frequency response (used
+        for the animation: real part of U * exp(i * phase)), None if not available."""
+        return self.get_deformation(step)
 
     # ---------------------------------------------------------------------------------------------- output
     @staticmethod
@@ -623,6 +659,7 @@ class NastranMesh:
         grid.point_data["Node ID"] = self.node_ids
         grid.cell_data["Element ID"] = self.element_ids
         grid.cell_data["Property ID"] = self.property_ids
+        self._grid_values["Property ID"] = self.property_ids.astype(float)
         if "Property ID" not in self.result_meta:
             self._register("Property ID", "cell", "Model", "Property ID")
         self._grid = grid
@@ -678,38 +715,65 @@ class ParseH5File(NastranMesh):
     _NODAL_COMPONENTS = ("X", "Y", "Z", "RX", "RY", "RZ")
     _CACHE_BYTES = 800e6                                        # memory for cached result arrays
 
-    def __init__(self, file_path, verbose=True):
+    def __init__(self, file_path, verbose=True, progress=None):
+        """
+        Args:
+            file_path: MSC Nastran HDF5 result file
+            verbose (bool): print messages
+            progress: optional function progress(fraction 0..1, text) called during loading (background loading
+                in the viewer; it may raise an exception to cancel the loading)
+        """
         import tables  # PyTables - reads the BLOSC compressed Nastran datasets
 
         super().__init__(file_path, verbose)
+        report = progress or (lambda fraction, text: None)
         self._tables = {}               # result table key -> description (path, blocks of domains, ...)
         self._quantities = {}           # result name -> definition (source table, components, operation)
         self._cache = OrderedDict()     # LRU cache of result arrays
+        self._cache_lock = threading.RLock()
         self._row_maps = {}             # (table key, domain) -> (sorted IDs, order) for single rows (history)
         self._adjacent = None           # node -> cells lookup (nodal averaged histories)
-        self._h5 = tables.open_file(str(self.file_path), mode="r")
-        h5 = self._h5
-        self._read_nodes(h5)
-        self._read_elements(h5)
-        self._read_domains(h5)
-        self._scan_results(h5)
-        self._make_steps()
-        self._register_results()
-        self.to_pyvista()                                       # mesh + Property ID
+        self._h5 = None
+        self.reopen = True              # False = the file is not opened again after close() (viewer closed it)
+        report(0.0, "opening the file")
+        with HDF5_LOCK:
+            self._h5 = tables.open_file(str(self.file_path), mode="r")
+        try:
+            h5 = self._h5
+            report(0.02, "reading nodes")
+            with HDF5_LOCK:
+                self._read_nodes(h5)
+            self._read_elements(h5, lambda k, n, name: report(0.05 + 0.45 * k / max(n, 1), f"reading {name}"))
+            report(0.5, "reading result domains")
+            with HDF5_LOCK:
+                self._read_domains(h5)
+                self._scan_results(h5)
+            self._make_steps()
+            report(0.6, "checking result tables")
+            self._register_results()
+            report(0.75, "building the mesh")
+            self.to_pyvista()                                   # mesh + Property ID
+        except BaseException:
+            self.close()                                        # do not keep the file locked after an error
+            raise
         self._log(f"File {self.file_path.name} was succesfully loaded")
 
     def _file(self):
         """Open H5 file (reopened after close())."""
         import tables
 
-        if self._h5 is None or not self._h5.isopen:
-            self._h5 = tables.open_file(str(self.file_path), mode="r")
-        return self._h5
+        with HDF5_LOCK:
+            if self._h5 is None or not self._h5.isopen:
+                if not self.reopen:
+                    raise RuntimeError(f"{self.file_path.name} was closed")
+                self._h5 = tables.open_file(str(self.file_path), mode="r")
+            return self._h5
 
     def close(self):
         """Closes the H5 file (it is opened again automatically when other results are needed)."""
-        if self._h5 is not None and self._h5.isopen:
-            self._h5.close()
+        with HDF5_LOCK:
+            if self._h5 is not None and self._h5.isopen:
+                self._h5.close()
 
     # ---------------------------------------------------------------------------------------------- mesh
     def _read_nodes(self, h5):
@@ -723,15 +787,20 @@ class ParseH5File(NastranMesh):
         if n_cd:
             self.messages.append(f"{n_cd} GRIDs have CD != 0 - their nodal results are in local coordinate systems!")
 
-    def _read_elements(self, h5):
+    def _read_elements(self, h5, progress=None):
         import tables
 
-        for tbl in h5.list_nodes("/NASTRAN/INPUT/ELEMENT"):
+        with HDF5_LOCK:
+            nodes = list(h5.list_nodes("/NASTRAN/INPUT/ELEMENT"))
+        for k, tbl in enumerate(nodes):
             name = tbl._v_name
+            if progress is not None:
+                progress(k, len(nodes), name)
             if not isinstance(tbl, tables.Table):
                 self.messages.append(f"{name}: not shown (unsupported element)")
                 continue
-            data = tbl.read()
+            with HDF5_LOCK:
+                data = tbl.read()
             fields = data.dtype.names
             pids = data["PID"] if "PID" in fields else np.zeros(len(data), dtype=np.int64)
             if name in self._ELEMENT_TYPES and "G" in fields:
@@ -759,8 +828,29 @@ class ParseH5File(NastranMesh):
         path = "/NASTRAN/RESULT/SUMMARY/EIGENVALUE"
         if path in h5:
             ev = h5.get_node(path).read()
-            if "MODE" in ev.dtype.names and "FREQ" in ev.dtype.names:
+            fields = ev.dtype.names
+            if "MODE" in fields and "FREQ" in fields:
                 self._mode_freq = {int(m): float(f) for m, f in zip(ev["MODE"], ev["FREQ"])}
+                order = np.argsort(ev["MODE"], kind="stable")
+                self.modes = {"mode": np.asarray(ev["MODE"][order], dtype=int),
+                              "freq": np.asarray(ev["FREQ"][order], dtype=float)}
+                for field, key in (("MASS", "mass"), ("STIFF", "stiff")):
+                    if field in fields:
+                        self.modes[key] = np.asarray(ev[field][order], dtype=float)
+
+    def enforced_motion(self):
+        """Enforced motion of the model (SPCD cards) -> list of (node ID, components e.g. "2" / "123", value)."""
+        path = "/NASTRAN/INPUT/CONSTRAINT/SPCD"
+        with HDF5_LOCK:
+            h5 = self._file()
+            if path not in h5:
+                return []
+            data = h5.get_node(path).read()
+        fields = data.dtype.names
+        if not all(f in fields for f in ("G", "C", "D")):
+            return []
+        return [(int(g), str(int(c)), float(d)) for g, c, d in zip(np.ravel(data["G"]), np.ravel(data["C"]),
+                                                                    np.ravel(data["D"]))]
 
     @staticmethod
     def _domain_blocks(h5, tbl):
@@ -826,20 +916,49 @@ class ParseH5File(NastranMesh):
                         path=tbl._v_pathname, kind="element", complex=cplx, base=base, comps=self._SOLID_COMPONENTS,
                         id_field="EID", element="C" + tbl._v_name, blocks=self._domain_blocks(h5, tbl))
 
+    @staticmethod
+    def _table_family(name):
+        """Results of a Nastran RANDOM analysis written to H5 (tables *_PSD, *_CRM, *_RMS, *_NO) -> "psd" / "rms",
+        other tables -> ""."""
+        tokens = set(name.upper().replace("/", "_").split("_"))
+        if tokens & {"RMS", "NO"}:
+            return "rms"
+        if tokens & {"PSD", "CRM"}:
+            return "psd"
+        return ""
+
+    def _nodal_label(self, base):
+        """DISPLACEMENT -> Displacement, ACCELERATION_PSD -> Acceleration PSD, ..."""
+        words = base.split("_")
+        for k in range(len(words), 0, -1):
+            head = "_".join(words[:k])
+            if head in self._NODAL_LABELS:
+                return " ".join([self._NODAL_LABELS[head]] + words[k:])
+        return base.replace("_", " ").capitalize()
+
     def _make_steps(self):
         domains = sorted({d for info in self._tables.values() for d in info["blocks"]})
         complex_domains = {d for info in self._tables.values() if info["complex"] for d in info["blocks"]}
         eigen_domains = {d for info in self._tables.values() if info["base"] == "EIGENVECTOR" for d in info["blocks"]}
+        families = defaultdict(set)                             # domain -> families of the tables containing it
+        for key, info in self._tables.items():
+            for d in info["blocks"]:
+                families[d].add(self._table_family(key))
         steps = []
         for d in domains:
             info = self._domain_info.get(d, dict(subcase=0, analysis=0, x=0.0, mode=0))
-            steps.append(dict(domain=d, subcase=info["subcase"], x=info["x"], mode=info["mode"],
+            family = next(iter(families[d])) if len(families[d]) == 1 else ""
+            steps.append(dict(domain=d, subcase=info["subcase"], x=info["x"], mode=info["mode"], family=family,
                               analysis=info["analysis"], complex=d in complex_domains, eigen=d in eigen_domains))
         subcases = defaultdict(list)
         for s in steps:
-            subcases[s["subcase"]].append(s)
-        for sc, group in subcases.items():
-            if any(s["analysis"] == 5 or s["complex"] for s in group):
+            subcases[(s["subcase"], s["family"])].append(s)
+        for (sc, family), group in subcases.items():
+            if family == "rms":
+                kind = "static"
+            elif family == "psd":
+                kind = "frequency"
+            elif any(s["analysis"] == 5 or s["complex"] for s in group):
                 kind = "frequency"
             elif any(s["analysis"] == 2 or s["eigen"] for s in group) and any(s["mode"] for s in group):
                 kind = "mode"
@@ -847,9 +966,15 @@ class ParseH5File(NastranMesh):
                 kind = "time"
             else:
                 kind = "static"
+            prefix = {"rms": "RANDOM RMS", "psd": "RANDOM PSD"}.get(family)
             for s in group:
                 s["kind"] = kind
-                if kind == "mode":
+                s["series"] = (sc, kind, family)                # steps of one course (time, frequency, modes)
+                if prefix and kind == "static":
+                    s["label"] = f"SC {sc}, {prefix}"
+                elif prefix:
+                    s["label"] = f"SC {sc}, {prefix} f = {s['x']:.5g} Hz"
+                elif kind == "mode":
                     s["x"] = float(s["mode"])
                     freq = self._mode_freq.get(s["mode"])
                     s["label"] = f"SC {sc}, mode {s['mode']}" + (f" ({freq:.4g} Hz)" if freq else "")
@@ -859,7 +984,7 @@ class ParseH5File(NastranMesh):
                     s["label"] = f"SC {sc}, t = {s['x']:.5g}"
                 else:
                     s["label"] = f"SC {sc}"
-        steps.sort(key=lambda s: (s["subcase"], s["x"], s["domain"]))
+        steps.sort(key=lambda s: (s["subcase"], s["family"], s["x"], s["domain"]))
         self.steps = steps
         self.domains = {s["domain"]: s["label"] for s in steps}
 
@@ -882,7 +1007,7 @@ class ParseH5File(NastranMesh):
 
         def add_nodal(key):
             info = self._tables[key]
-            label = self._NODAL_LABELS.get(info["base"], info["base"].replace("_", " ").capitalize())
+            label = self._nodal_label(info["base"])
             comps = info["comps"]
             domains = list(info["blocks"])
             samples = [domains[0], domains[len(domains) // 2], domains[-1]]
@@ -932,27 +1057,31 @@ class ParseH5File(NastranMesh):
 
     # ---------------------------------------------------------------------------------------------- reading
     def _cache_get(self, key):
-        if key in self._cache:
-            self._cache.move_to_end(key)
-            return self._cache[key]
+        with self._cache_lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
         return None
 
     def _cache_put(self, key, value):
-        self._cache[key] = value
         size = lambda v: sum(a.nbytes for a in v.values()) if isinstance(v, dict) else getattr(v, "nbytes", 0)
-        while len(self._cache) > 1 and sum(size(v) for v in self._cache.values()) > self._CACHE_BYTES:
-            self._cache.popitem(last=False)
+        with self._cache_lock:
+            self._cache[key] = value
+            while len(self._cache) > 1 and sum(size(v) for v in self._cache.values()) > self._CACHE_BYTES:
+                self._cache.popitem(last=False)
         return value
 
     def _read_rows(self, key, rows):
         """Rows of a table: (start, stop) or array of row numbers."""
-        tbl = self._file().get_node(self._tables[key]["path"])
-        if isinstance(rows, tuple):
-            return tbl.read(*rows)
-        return tbl.read_coordinates(np.asarray(rows, dtype=np.int64))
+        with HDF5_LOCK:
+            tbl = self._file().get_node(self._tables[key]["path"])
+            if isinstance(rows, tuple):
+                return tbl.read(*rows)
+            return tbl.read_coordinates(np.asarray(rows, dtype=np.int64))
 
-    def _nodal_array(self, key, domain):
-        """Nodal table of one domain -> array (n_nodes, n_components) in node order (complex for *_CPLX)."""
+    def _nodal_array(self, key, domain, cache=True):
+        """Nodal table of one domain -> array (n_nodes, n_components) in node order (complex for *_CPLX).
+        cache=False -> the array is not stored in the cache (sweeps over all domains, e.g. random response)."""
         cached = self._cache_get(("nodal", key, domain))
         if cached is not None:
             return cached
@@ -969,7 +1098,7 @@ class ParseH5File(NastranMesh):
             values = np.column_stack([rows[c] for c in info["comps"]]).astype(float)
         array = np.full((len(self.node_ids), len(info["comps"])), np.nan, dtype=values.dtype)
         array[idx[ok]] = values[ok]
-        return self._cache_put(("nodal", key, domain), array)
+        return self._cache_put(("nodal", key, domain), array) if cache else array
 
     def _element_values(self, rows, cplx):
         """Element table rows -> (GRID ids (n, positions), values (n, positions, 6))."""
@@ -989,7 +1118,7 @@ class ParseH5File(NastranMesh):
             return values[:, 0, :], grid_ids[:, 1:], values[:, 1:, :]
         return values.mean(axis=1), grid_ids, values
 
-    def _element_arrays(self, base, cplx, domain):
+    def _element_arrays(self, base, cplx, domain, cache=True):
         """Element results of one domain -> {"cell": (n_cells, 6), "node": (n_nodes, 6) nodal averaged}."""
         cache_key = ("element", base, cplx, domain)
         cached = self._cache_get(cache_key)
@@ -1021,7 +1150,8 @@ class ParseH5File(NastranMesh):
             node = total / count[:, None]
         node[count == 0] = np.nan
         self._fill_midside_nodes(node)
-        return self._cache_put(cache_key, {"cell": cell, "node": node})
+        result = {"cell": cell, "node": node}
+        return self._cache_put(cache_key, result) if cache else result
 
     def _derive(self, s, q, mode):
         """Stress / strain components (n, 6) -> result of the quantity."""
@@ -1060,7 +1190,7 @@ class ParseH5File(NastranMesh):
             result = np.full(n, np.nan) if arrays is None else self._derive(arrays[q["where"]], q, mode)
         return self._cache_put(cache_key, np.asarray(result, dtype=float))
 
-    def get_deformation(self, step=0, phase=0.0):
+    def deformation_vectors(self, step=0):
         if not self.steps:
             return None
         domain = self.steps[step]["domain"]
@@ -1071,14 +1201,22 @@ class ParseH5File(NastranMesh):
                 if not all(c in info["comps"] for c in ("X", "Y", "Z")):
                     continue
                 array = self._nodal_array(key, domain)[:, [info["comps"].index(c) for c in ("X", "Y", "Z")]]
-                if np.iscomplexobj(array):
-                    array = (array * np.exp(1j * np.radians(phase))).real
                 return np.nan_to_num(array)
         return None
+
+    def get_deformation(self, step=0, phase=0.0):
+        array = self.deformation_vectors(step)
+        if array is not None and np.iscomplexobj(array):
+            array = (array * np.exp(1j * np.radians(phase))).real
+        return array
 
     # ---------------------------------------------------------------------------------------------- history
     def _row_map(self, key, domain):
         """Sorted IDs of the rows of a table block + their order (to find the row of one node / element)."""
+        with HDF5_LOCK:
+            return self._row_map_locked(key, domain)
+
+    def _row_map_locked(self, key, domain):
         info = self._tables[key]
         if "same_order" not in info:                            # do all blocks list the IDs in the same order?
             blocks = list(info["blocks"].items())
@@ -1129,10 +1267,14 @@ class ParseH5File(NastranMesh):
 
     def _cells_of_node(self, node):
         """Cells which have the node as a corner node."""
-        if self._adjacent is None:
-            linear = self._make_grid(self._linear_blocks(), self.points)
-            conn = np.asarray(linear.cell_connectivity)
-            cells = np.repeat(np.arange(linear.n_cells), np.diff(np.asarray(linear.offset)))
+        if self._adjacent is None:                              # numpy only (no VTK - also for threads)
+            conns, cells, offset = [], [], 0
+            for _, block in self._linear_blocks():
+                n, k = block.shape
+                conns.append(block.ravel())
+                cells.append(np.repeat(np.arange(offset, offset + n), k))
+                offset += n
+            conn, cells = np.concatenate(conns), np.concatenate(cells)
             order = np.argsort(conn, kind="stable")
             self._adjacent = (conn[order], cells[order])
         conn, cells = self._adjacent
@@ -1187,12 +1329,30 @@ class ParseH5File(NastranMesh):
                     return 0.5 * (node_history(conn[rows[0], a]) + node_history(conn[rows[0], b]))
         return np.full((len(domains), 6), np.nan, dtype=dtype)
 
+    def series_steps(self, step=0):
+        """Indices of the steps of the same course as `step` (time steps / frequencies / modes of one subcase)."""
+        if not self.steps:
+            return []
+        series = self.steps[step]["series"]
+        return [i for i, s in enumerate(self.steps) if s["series"] == series]
+
+    def nodal_history(self, key, index, domains):
+        """Components (n_domains, n_components) of nodal table `key` in node `index` (complex for *_CPLX)."""
+        info = self._tables[key]
+        dtype = complex if info["complex"] else float
+        data = np.full((len(domains), len(info["comps"])), np.nan, dtype=dtype)
+        for i, row in enumerate(self._rows_of_id(key, domains, int(self.node_ids[index]))):
+            if row is not None:
+                if info["complex"]:
+                    data[i] = [row[c + "R"][0] + 1j * row[c + "I"][0] for c in info["comps"]]
+                else:
+                    data[i] = [row[c][0] for c in info["comps"]]
+        return data
+
     def history(self, name, index, step=0, mode="amplitude"):
         if name not in self._quantities or not self.steps:
             return None
-        current = self.steps[step]
-        selected = [i for i, s in enumerate(self.steps) if s["subcase"] == current["subcase"]
-                    and s["kind"] == current["kind"]]
+        selected = self.series_steps(step)
         if len(selected) < 2:
             return None
         q = self._quantities[name]
@@ -1200,15 +1360,7 @@ class ParseH5File(NastranMesh):
         domains = [self.steps[i]["domain"] for i in selected]
         x = np.array([self.steps[i]["x"] for i in selected])
         if q["source"] == "nodal":
-            info = self._tables[q["table"]]
-            dtype = complex if info["complex"] else float
-            data = np.full((len(domains), len(info["comps"])), np.nan, dtype=dtype)
-            for i, row in enumerate(self._rows_of_id(q["table"], domains, int(self.node_ids[index]))):
-                if row is not None:
-                    if info["complex"]:
-                        data[i] = [row[c + "R"][0] + 1j * row[c + "I"][0] for c in info["comps"]]
-                    else:
-                        data[i] = [row[c][0] for c in info["comps"]]
+            data = self.nodal_history(q["table"], index, domains)
             if q["op"] == "magnitude":
                 y = self.vector_magnitude(data[:, q["cols"]], mode)
             else:
@@ -1224,9 +1376,7 @@ if __name__ == "__main__":
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # project root -> "visualization" package
-    from visualization.h5_viewer import H5ResultViewer
+    from visualization.viewer_window import open_viewer
 
-    h5_file = Path(__file__).resolve().parent / "box2_weight1g_z_ch.h5"
-    h5_results = ParseH5File(h5_file)
-    h5_results.print_summary()
-    H5ResultViewer(h5_results).show()
+    # the file is loaded in the background (progress in the status bar), other files: File > Open / drag & drop
+    open_viewer(Path(__file__).resolve().parent / "box2_weight1g_z_ch.h5")

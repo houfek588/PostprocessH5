@@ -1,7 +1,7 @@
 """
 Preprocessing of a Nastran input file (*.bdf / *.dat / *.nas): reads the model, analyses it and shows it in 3D.
 
-    python Preprocess/main_preprocess.py                    -> dialog to choose the BDF file
+    python Preprocess/main_preprocess.py                    -> empty window (File > Open, drag & drop, recent)
     python Preprocess/main_preprocess.py path/to/model.bdf  -> given file
     (or set BDF_FILE below)
 
@@ -19,27 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from Preprocess.bdf_model import BdfModel  # noqa: E402
-from Preprocess.bdf_viewer import BdfViewer  # noqa: E402
-from visualization.h5_viewer import qt_app  # noqa: E402
-from qtpy import QtWidgets  # noqa: E402
+from visualization.viewer_window import open_viewer  # noqa: E402
 
-# fixed input file (None = file dialog / command line argument), e.g. ROOT / "edit.bdf"
+# fixed input file (None = empty window: File > Open, drag & drop, recent files / command line argument),
+# e.g. ROOT / "edit.bdf"
 BDF_FILE = None
 
 
-def choose_file():
-    qt_app()                                                    # Qt application must exist before the dialog
-    path, _ = QtWidgets.QFileDialog.getOpenFileName(None, "Open Nastran input file", str(ROOT),
-                                                    "Nastran input (*.bdf *.dat *.nas *.blk);;All files (*)")
-    return path or None
-
-
 if __name__ == "__main__":
-    bdf_file = Path(sys.argv[1]) if len(sys.argv) > 1 else BDF_FILE or choose_file()
-    if bdf_file is None:
-        sys.exit("No file selected.")
-
-    model = BdfModel(bdf_file)
-    print(model.report)
-    BdfViewer(model).show()
+    bdf_file = Path(sys.argv[1]) if len(sys.argv) > 1 else BDF_FILE
+    # the model is read and analysed in the background (progress in the status bar), the report is printed to the
+    # console and shown in the tab "Report"; other files: File > Open or drag & drop (also H5 results)
+    open_viewer(bdf_file)
